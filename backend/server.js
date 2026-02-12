@@ -16,24 +16,45 @@ const allowedOrigins = [
     'http://localhost:5173',
     'http://localhost:3000',
     ...(process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : []),
-    process.env.FRONTEND_URL
-].filter(Boolean);
+    process.env.FRONTEND_URL,
+    'https://privateqa.netlify.app'
+].map(o => o?.trim().replace(/\/$/, '')).filter(Boolean);
+
+console.log('📡 Allowed Origins:', allowedOrigins);
 
 app.use(cors({
-    origin: allowedOrigins,
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+
+        const normalizedOrigin = origin.trim().replace(/\/$/, '');
+
+        if (allowedOrigins.includes(normalizedOrigin)) {
+            callback(null, true);
+        } else {
+            console.log('⚠️ Blocked by CORS:', origin);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     credentials: true
 }));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// Helper: Get user's private upload directory
+const getSessionDir = (sessionId) => {
+    const safeSessionId = (sessionId || 'default').replace(/[^a-z0-9_-]/gi, '_');
+    const userPath = path.join(__dirname, 'uploads', safeSessionId);
+    if (!fs.existsSync(userPath)) {
+        fs.mkdirSync(userPath, { recursive: true });
+    }
+    return userPath;
+};
+
 // File upload configuration using Multer
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        const uploadPath = path.join(__dirname, 'uploads');
-        if (!fs.existsSync(uploadPath)) {
-            fs.mkdirSync(uploadPath);
-        }
-        cb(null, uploadPath);
+        const sessionId = req.headers['x-session-id'] || 'default';
+        cb(null, getSessionDir(sessionId));
     },
     filename: (req, file, cb) => {
         cb(null, Date.now() + '-' + file.originalname);
@@ -41,8 +62,28 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Simple in-memory storage for document metadata during session
-let documents = [];
+// Helper: Scan directory for user's documents
+const getSessionDocuments = (sessionId) => {
+    const sessionDir = getSessionDir(sessionId);
+    if (!fs.existsSync(sessionDir)) return [];
+
+    const files = fs.readdirSync(sessionDir);
+    return files
+        .filter(f => f !== '.DS_Store' && f.includes('-'))
+        .map(filename => {
+            const filePath = path.join(sessionDir, filename);
+            const stats = fs.statSync(filePath);
+            const originalName = filename.substring(filename.indexOf('-') + 1);
+            return {
+                id: filename.split('-')[0],
+                name: originalName,
+                filename: filename,
+                path: filePath,
+                size: stats.size,
+                uploadDate: stats.mtime
+            };
+        });
+};
 
 // Helper: Read file content safely
 const readFileContent = (filePath) => {
@@ -124,6 +165,18 @@ const callGeminiAPI = (prompt) => {
 
 // Routes
 
+// Root Welcome Route
+app.get('/', (req, res) => {
+    res.send(`
+        <div style="font-family: sans-serif; padding: 40px; text-align: center;">
+            <h1 style="color: #2563eb;">Private QA Backend is Live! 🚀</h1>
+            <p>The API is running and ready for connections.</p>
+            <hr style="max-width: 400px; margin: 20px auto; opacity: 0.2;">
+            <p style="color: #64748b; font-size: 14px;">Use <b>/api/health</b> to check status.</p>
+        </div>
+    `);
+});
+
 // Health Check
 app.get('/api/health', (req, res) => {
     res.json({
@@ -142,41 +195,42 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
         return res.status(400).json({ error: 'No file uploaded' });
     }
 
+    const sessionId = req.headers['x-session-id'] || 'default';
+    const originalName = req.file.filename.substring(req.file.filename.indexOf('-') + 1);
+
     const newDoc = {
-        id: Date.now().toString(),
-        name: req.file.originalname,
-        filename: req.file.filename,
-        path: req.file.path,
+        id: req.file.filename.split('-')[0],
+        name: originalName,
         size: req.file.size,
         uploadDate: new Date()
     };
 
-    documents.push(newDoc);
-
+    console.log(`📂 User [${sessionId}] uploaded: ${originalName}`);
     res.status(201).json({ message: 'File uploaded successfully', document: newDoc });
 });
 
 // List Documents
 app.get('/api/documents', (req, res) => {
-    res.json(documents);
+    const sessionId = req.headers['x-session-id'] || 'default';
+    const docs = getSessionDocuments(sessionId);
+    res.json(docs);
 });
 
 // Delete Document
 app.delete('/api/documents/:id', (req, res) => {
+    const sessionId = req.headers['x-session-id'] || 'default';
     const docId = req.params.id;
-    const docIndex = documents.findIndex(d => d.id === docId);
+    const sessionDir = getSessionDir(sessionId);
 
-    if (docIndex === -1) {
+    // Find file starting with this id
+    const files = fs.readdirSync(sessionDir);
+    const targetFile = files.find(f => f.startsWith(docId));
+
+    if (!targetFile) {
         return res.status(404).json({ error: 'Document not found' });
     }
 
-    const doc = documents[docIndex];
-    if (fs.existsSync(doc.path)) {
-        fs.unlinkSync(doc.path);
-    }
-
-    documents.splice(docIndex, 1);
-
+    fs.unlinkSync(path.join(sessionDir, targetFile));
     res.json({ message: 'Document deleted successfully' });
 });
 
@@ -194,9 +248,11 @@ app.post('/api/ask', async (req, res) => {
     }
 
     try {
-        // 1. Prepare Context from Documents
+        // 1. Prepare Context from User's Private Documents
+        const sessionId = req.headers['x-session-id'] || 'default';
+        const userDocs = getSessionDocuments(sessionId);
         let allChunks = [];
-        documents.forEach(doc => {
+        userDocs.forEach(doc => {
             const content = readFileContent(doc.path);
             const chunks = chunkDocument(content, doc.id, doc.name);
             allChunks.push(...chunks);
@@ -297,8 +353,10 @@ Answer:`;
 });
 
 // Start Server
-app.listen(PORT, () => {
-    console.log(`✓ Server running on port 5000`);
-    console.log(`✓ Gemini API: ${GEMINI_API_KEY ? 'CONFIGURED' : 'NOT CONFIGURED'}`);
-    console.log(`✓ Using direct REST API for maximum compatibility`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n--------------------------------------`);
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌍 URL: http://localhost:${PORT}`);
+    console.log(`✅ Gemini API: ${GEMINI_API_KEY ? 'CONFIGURED' : 'MISSING'}`);
+    console.log(`--------------------------------------\n`);
 });
